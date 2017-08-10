@@ -9,6 +9,9 @@ import onmt.modules
 import argparse
 import torch
 import torch.nn as nn
+import torch.utils.data
+import torch.utils.data.distributed
+import torch.distributed as dist
 from torch import cuda
 
 parser = argparse.ArgumentParser(description='train.py')
@@ -170,6 +173,14 @@ parser.add_argument('-seed', type=int, default=-1,
                     help="""Random seed used for the experiments
                     reproducibility.""")
 
+# distributed
+parser.add_argument('-world-size', default=1, type=int,
+                    help='number of distributed processes')
+parser.add_argument('-dist-url', default='tcp://224.66.41.62:23456', type=str,
+                    help='url used to set up distributed training')
+parser.add_argument('-dist-backend', default='gloo', type=str,
+                    help='distributed backend')
+
 opt = parser.parse_args()
 
 print(opt)
@@ -185,6 +196,7 @@ if opt.gpus:
     if opt.seed > 0:
         torch.cuda.manual_seed(opt.seed)
 
+opt.distributed = opt.world_size > 1
 
 # Set up the Crayon logging server.
 if opt.log_server != "":
@@ -226,6 +238,9 @@ def trainModel(model, trainData, validData, dataset, optim):
     else:
         criterion = onmt.modules.CopyCriterion
 
+    if opt.distributed:
+        trainSampler = torch.utils.data.distributed.DistributedSampler(trainData)
+
     def trainEpoch(epoch):
         if opt.extra_shuffle and epoch > opt.curriculum:
             trainData.shuffle()
@@ -238,10 +253,9 @@ def trainModel(model, trainData, validData, dataset, optim):
         batchOrder = torch.randperm(len(trainData))
 
         total_stats = onmt.Loss.Statistics()
-        report_stats = onmt.Loss.Statistics()
 
-        for i in range(len(trainData)):
-            batchIdx = batchOrder[i] if epoch > opt.curriculum else i
+        def trainBatch(i, batchIdx):
+            report_stats = onmt.Loss.Statistics()
             batch = trainData[batchIdx]
             target_size = batch.tgt.size(0)
 
@@ -279,6 +293,17 @@ def trainModel(model, trainData, validData, dataset, optim):
                     report_stats.log("progress", experiment, optim)
                 report_stats = onmt.Loss.Statistics()
 
+        if opt.distributed:
+            trainSampler.set_epoch(epoch)
+            for i, batchIdx in enumerate(trainSampler):
+                trainBatch(i, batchIdx)
+        else:
+            # Shuffle mini batch order.
+            batchOrder = torch.randperm(len(trainData))
+            for i in range(len(trainData)):
+                batchIdx = batchOrder[i] if epoch > opt.curriculum else i
+                trainBatch(i, batchIdx)
+
         return total_stats
 
     for epoch in range(opt.start_epoch, opt.epochs + 1):
@@ -302,12 +327,12 @@ def trainModel(model, trainData, validData, dataset, optim):
         #  (3) update the learning rate
         optim.updateLearningRate(valid_stats.ppl(), epoch)
 
-        model_state_dict = (model.module.state_dict() if len(opt.gpus) > 1
+        model_state_dict = (model.module.state_dict() if opt.distributed or len(opt.gpus) > 1
                             else model.state_dict())
         model_state_dict = {k: v for k, v in model_state_dict.items()
                             if 'generator' not in k}
         generator_state_dict = (model.generator.module.state_dict()
-                                if len(opt.gpus) > 1
+                                if opt.distributed or len(opt.gpus) > 1
                                 else model.generator.state_dict())
         #  (4) drop a checkpoint
         if epoch >= opt.start_checkpoint_at:
@@ -412,7 +437,13 @@ def main():
         model.cpu()
         generator.cpu()
 
-    if len(opt.gpus) > 1:
+    if opt.distributed:
+        print('Multi machine training ', opt.world_size)
+        dist.init_process_group(backend=opt.dist_backend, init_method=opt.dist_url,
+                                world_size=opt.world_size)
+        model = nn.parallel.DataParallel(model, device_ids=opt.gpus, dim=1)
+        generator = nn.parallel.DataParallel(generator, device_ids=opt.gpus, dim=0)
+    elif len(opt.gpus) > 1:
         print('Multi gpu training ', opt.gpus)
         model = nn.DataParallel(model, device_ids=opt.gpus, dim=1)
         generator = nn.DataParallel(generator, device_ids=opt.gpus, dim=0)
